@@ -24,6 +24,23 @@ and contains a patch that pays neither price: it asserts the printer's BUSY
 line while the backend is full, so the guest waits the way it would for a slow
 printer, and the vCPU thread stays free.
 
+## Symptoms
+
+If this is what you are hitting, you will have seen some of these:
+
+- The guest hangs while printing to a parallel port (`LPT1`), usually part-way
+  through a job, and never comes back.
+- QEMU itself stops responding. The HMP monitor accepts a connection but never
+  answers `info status`; the display stops redrawing.
+- `SIGTERM` appears to be ignored and only `kill -9` ends the process. It is not
+  really ignored — the signal is waiting its turn behind the stuck write, and
+  QEMU exits the moment the write completes.
+- It happens with a `socket` chardev whose peer is connected but has stopped
+  reading — a print spooler that stalled, for instance. A `file` chardev never
+  triggers it, because writing to a file does not return `EAGAIN`.
+- Small jobs do not trigger it. The kernel socket buffer swallows them whole, so
+  a one-megabyte job can finish while nothing on the far end reads a single byte.
+
 | | before | after |
 |---|---|---|
 | HMP `info status` while stalled | no answer | `VM status: running` |
@@ -34,7 +51,9 @@ printer, and the vCPU thread stays free.
 Verified on two guests — a 0.2-second-boot Linux harness and a real Windows XP
 install — against QEMU 11.1.50 (`v11.1.0-1474-g43922bf55e`).
 
-**The detailed write-ups below are in Korean.** 아래 문서는 한국어입니다.
+**[Read the write-up →](https://zirize.github.io/qemu-parallel-port-freeze/)** (English)
+
+**The detailed documents in this repository are in Korean.** 아래 문서는 한국어입니다.
 
 ---
 

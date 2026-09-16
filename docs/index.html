@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>QEMU freezes when printing to a parallel port: the blocking chardev write</title>
+<meta name="description" content="A guest writing to the parallel port can freeze the whole QEMU VM — the monitor stops answering and SIGTERM is ignored. Why it happens, why small print jobs never reproduce it, and a patch that uses the printer BUSY line as back-pressure instead of blocking the vCPU thread." />
+<meta name="author" content="zirize" />
+<meta name="robots" content="index, follow" />
+<link rel="canonical" href="https://zirize.github.io/qemu-parallel-port-freeze/" />
+<meta property="og:type" content="article" />
+<meta property="og:url" content="https://zirize.github.io/qemu-parallel-port-freeze/" />
+<meta property="og:title" content="QEMU freezes when printing to a parallel port" />
+<meta property="og:description" content="One chardev write spins on the vCPU thread holding the BQL, so the whole VM stops. Root cause, reproducer, and a non-blocking fix." />
+<meta name="twitter:card" content="summary" />
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "TechArticle",
+  "headline": "QEMU freezes when printing to a parallel port",
+  "description": "A parallel-port write can freeze the entire QEMU VM, including the monitor, because qemu_chr_fe_write_all() retries EAGAIN in a sleep loop on a vCPU thread holding the BQL. Root cause, reproducer, and a non-blocking fix using the printer BUSY line.",
+  "url": "https://zirize.github.io/qemu-parallel-port-freeze/",
+  "author": { "@type": "Person", "name": "zirize", "url": "https://github.com/zirize" },
+  "about": ["QEMU", "parallel port", "LPT1", "chardev", "printing", "Windows XP", "KVM"]
+}
+</script>
+<style>
+:root{--bg:#0f1117;--surface:#1a1d27;--border:#2d3148;--accent:#7c6af7;--accent2:#56c8a0;--text:#e2e4ef;--muted:#8b90b0;--radius:10px}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);line-height:1.7;font-size:16px;min-height:100vh;display:flex;flex-direction:column}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+header{background:linear-gradient(135deg,#1a1d27 0%,#12141e 100%);border-bottom:1px solid var(--border);padding:56px 20px 44px;text-align:center}
+header h1{font-size:clamp(1.6rem,4vw,2.4rem);font-weight:700;background:linear-gradient(90deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;margin-bottom:12px}
+header p{font-size:1.05rem;color:var(--muted);max-width:620px;margin:0 auto 22px}
+.btns{display:flex;gap:10px;justify-content:center;flex-wrap:wrap}
+.btns a{display:inline-flex;align-items:center;gap:6px;padding:8px 18px;border-radius:var(--radius);background:var(--surface);border:1px solid var(--border);color:var(--text);font-size:.9rem;font-weight:500}
+.btns a:hover{text-decoration:none;border-color:var(--accent)}
+.btns a.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+main{max-width:820px;margin:0 auto;padding:48px 20px;flex:1}
+h2{font-size:1.35rem;margin:44px 0 14px;color:var(--text)}
+h2:first-child{margin-top:0}
+h3{font-size:1.05rem;margin:28px 0 10px;color:var(--accent2)}
+p{margin-bottom:14px;color:var(--text)}
+ul,ol{margin:0 0 16px 22px}
+li{margin-bottom:8px}
+code{font-family:ui-monospace,'Cascadia Code',Menlo,monospace;font-size:.88em;background:#12141e;border:1px solid var(--border);border-radius:5px;padding:1px 6px}
+pre{background:#12141e;border:1px solid var(--border);border-radius:var(--radius);padding:16px;overflow-x:auto;margin-bottom:16px}
+pre code{background:none;border:none;padding:0;font-size:.85rem;line-height:1.6}
+table{width:100%;border-collapse:collapse;margin-bottom:18px;font-size:.92rem}
+th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--border);vertical-align:top}
+th{color:var(--muted);font-weight:600;font-size:.82rem;text-transform:uppercase;letter-spacing:.5px}
+.symptoms{background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--accent2);border-radius:var(--radius);padding:20px 24px 8px;margin-bottom:8px}
+.note{background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:var(--radius);padding:14px 18px;margin-bottom:16px;font-size:.93rem;color:var(--muted)}
+.note strong{color:var(--text)}
+footer{text-align:center;padding:32px 20px;border-top:1px solid var(--border);color:var(--muted);font-size:.85rem}
+</style>
+</head>
+<body>
+<header>
+  <h1>QEMU freezes when printing to a parallel port</h1>
+  <p>One byte handed to a chardev backend can stop the entire VM — guest, display, monitor and signal handling — because the write spins on a vCPU thread holding the big QEMU lock.</p>
+  <div class="btns">
+    <a class="primary" href="https://github.com/zirize/qemu-parallel-port-freeze">Repository</a>
+    <a href="https://github.com/zirize/qemu-parallel-port-freeze/blob/main/patches/0001-parallel-nonblocking-tx.patch">The patch</a>
+  </div>
+</header>
+<main>
+
+<div class="symptoms">
+<p>If you landed here from a search engine, this is probably what you are seeing:</p>
+<ul>
+<li>A guest <strong>hangs while printing</strong> to a parallel port (<code>LPT1</code>), usually part-way through a job, and never comes back.</li>
+<li><strong>QEMU itself stops responding.</strong> The HMP monitor accepts a connection but never answers <code>info status</code>, and the display stops redrawing.</li>
+<li><strong><code>SIGTERM</code> appears to be ignored</strong> and only <code>kill -9</code> ends the process.</li>
+<li>It happens with a <code>socket</code> chardev whose peer is connected but <strong>has stopped reading</strong> — a print spooler that stalled, for instance. A <code>file</code> chardev never triggers it.</li>
+<li><strong>Small jobs do not reproduce it.</strong> A one-megabyte job can finish normally while nothing on the far end reads a single byte.</li>
+</ul>
+</div>
+
+<h2>1. What the VM is doing when it stops</h2>
+
+<p>Every time the guest raises the STROBE line, <code>hw/char/parallel.c</code> hands one byte to the character device backend:</p>
+
+<pre><code>if ((s-&gt;control &amp; PARA_CTR_STROBE) == 0)
+    qemu_chr_fe_write_all(&amp;s-&gt;chr, &amp;s-&gt;dataw, 1);</code></pre>
+
+<p>That call does not return until the byte is gone. In <code>chardev/char.c</code> it becomes a retry loop:</p>
+
+<pre><code>retry:
+    res = cc-&gt;chr_write(s, buf + *offset, len - *offset);
+    if (res &lt; 0 &amp;&amp; errno == EAGAIN &amp;&amp; write_all) {
+        g_usleep(100);
+        goto retry;
+    }</code></pre>
+
+<p>The caller is a vCPU thread, and it holds the BQL. A stack taken while the VM was stuck shows both halves of the problem at once:</p>
+
+<pre><code>TID (vCPU)                         TID (main thread)
+  g_usleep                           __lll_lock_wait
+  qemu_chr_write_buffer              __pthread_mutex_lock
+  qemu_chr_write                     qemu_mutex_lock_impl
+  parallel_ioport_write_sw           main_loop_wait
+  memory_region_write_accessor</code></pre>
+
+<p>The left column starves the right one. The guest cannot advance because its vCPU is inside the loop, and the main loop cannot run because it never gets the lock — which is why the monitor goes silent and the display stops.</p>
+
+<div class="note"><strong><code>SIGTERM</code> is not being ignored.</strong> It is waiting its turn behind the stuck write. In one run the signal was delivered, nothing happened for twelve seconds, and the moment the far end resumed reading, QEMU finished the write and exited immediately — processing the signal that had been queued all along.</div>
+
+<h2>2. Why the code is written that way</h2>
+
+<p>The comment above that call has been in the tree since 2016, in commit <code>6ab3fc32ea</code>:</p>
+
+<pre><code>/* XXX this blocks entire thread. Rewrite to use
+ * qemu_chr_fe_write and background I/O callbacks */</code></pre>
+
+<p>That commit is worth reading, because it moved <em>away</em> from the non-blocking call:</p>
+
+<pre><code>-    qemu_chr_fe_write(s-&gt;chr, &amp;s-&gt;dataw, 1);
++    /* XXX this blocks entire thread. Rewrite to use
++     * qemu_chr_fe_write and background I/O callbacks */
++    qemu_chr_fe_write_all(s-&gt;chr, &amp;s-&gt;dataw, 1);</code></pre>
+
+<p>Its message explains why: almost no caller of <code>qemu_chr_fe_write()</code> checked the return value, so an <code>EAGAIN</code> meant bytes were <strong>silently dropped</strong>. Data loss was traded for a blocked thread, and the comment records the cost of that trade. The fix below pays neither price.</p>
+
+<h2>3. Small jobs will not reproduce it</h2>
+
+<p>The kernel socket send buffer absorbs the job before the write ever sees <code>EAGAIN</code>. If the job is smaller than that buffer, everything completes normally even though the peer never reads a byte.</p>
+
+<table>
+<tr><th>Configuration</th><th>Stalls after</th></tr>
+<tr><td>Linux harness, sink with a 4 KB receive buffer</td><td>1,357,824 bytes</td></tr>
+<tr><td>Windows XP guest</td><td>1,792,000 bytes</td></tr>
+<tr><td>For scale — one Windows XP printer test page</td><td>146,613 bytes</td></tr>
+</table>
+
+<p>On XP, <code>copy /b c:\windows\explorer.exe lpt1:</code> (1,025,049 bytes) <strong>completes normally</strong> against a sink that reads nothing at all. A printer test page is a twelfth of the threshold. So a stalled backend plus a small job looks perfectly healthy — do not conclude from that test that you are safe.</p>
+
+<h2>4. The fix: assert BUSY instead of blocking</h2>
+
+<p>A real printer that cannot accept data keeps its BUSY line asserted, and the host side of a parallel port has no way to stall the bus. So when the backend is full, do the same thing:</p>
+
+<ul>
+<li>Use the non-blocking <code>qemu_chr_fe_write()</code>. On <code>EAGAIN</code>, arm a <code>G_IO_OUT</code> watch and return immediately.</li>
+<li><strong>Leave BUSY asserted</strong> while the write is outstanding. The guest driver waits the way it would for a slow printer, and the vCPU thread is free.</li>
+<li>Suppress the ACK/BUSY restore sequence in the status-register read while a write is pending — otherwise the guest pushes the next byte into a full pipe.</li>
+<li>Withhold the acknowledge interrupt until the byte has really gone out.</li>
+<li>If a strobe arrives anyway, the guest ignored BUSY; drop that byte, as real hardware would garble it.</li>
+<li>The pending byte is migration state, so it travels in a vmstate subsection and <code>post_load</code> re-arms the watch.</li>
+</ul>
+
+<p>A <code>file</code> chardev never returns <code>EAGAIN</code> and is unaffected. An unconnected socket still fails with <code>EIO</code> and drops the byte, exactly as before.</p>
+
+<h2>5. What changed, measured</h2>
+
+<p>Same reproducer, same stalling sink, two builds differing by this patch alone:</p>
+
+<table>
+<tr><th></th><th>Before</th><th>After</th></tr>
+<tr><td>HMP <code>info status</code> while stalled</td><td>no answer</td><td><code>VM status: running</code></td></tr>
+<tr><td>vCPU thread state</td><td><code>hrtimer_nanosleep</code></td><td><code>kvm_vcpu_block</code></td></tr>
+<tr><td>Main thread state</td><td><code>futex_do_wait</code></td><td><code>poll_schedule_timeout</code></td></tr>
+<tr><td><code>SIGTERM</code></td><td>ignored 10-12 s, needs <code>kill -9</code></td><td>exits within 2 s</td></tr>
+<tr><td>Bytes delivered once the peer resumes reading</td><td>not guaranteed</td><td>all of them, byte-exact</td></tr>
+</table>
+
+<p>The guest stalls at the same byte in both builds — 1,792,000 on XP — which is the point. The patch does not remove the back-pressure; it moves it to the layer that is supposed to carry it. Before, the host froze. After, only the guest waits.</p>
+
+<p>Nothing is lost. A Linux guest pushed 1,638,400 bytes (200 &times; 8192) and a Windows XP guest 4,126,720 bytes (4 &times; 1,031,680) through a sink that stalled for three minutes; both arrived complete and byte-exact once it resumed reading. With the interrupt-driven path exercised, the parallel port interrupt count went from 0 to 1,638,600, so the deferred-acknowledge path is covered too.</p>
+
+<h2>6. Reproducing it</h2>
+
+<p>The harness is a Linux guest built from an 8 MB kernel and a 1 MB static busybox. It boots to a result in <strong>0.2 seconds</strong> and touches the parallel port <strong>zero times</strong> when idle, which is the whole point — on a desktop guest, X and udev generate enough register traffic that you cannot attribute anything.</p>
+
+<pre><code>guest/fetch-deps.sh          # kernel, busybox, parport modules
+guest/build-initramfs.sh
+
+export LPT_BIN=/path/to/qemu-system-i386
+scripts/stall-sink.py 600 /tmp/sink.bin &amp;
+
+NOTRACE=1 FLOODN=1024 \
+  LPT_CHARDEV="socket,id=lptfile,host=127.0.0.1,port=9100,server=off" \
+  TMO=240 scripts/lpt-linux.sh freeze flood</code></pre>
+
+<p>To tell a frozen host from a guest that is merely busy-waiting, ask the monitor. A blocking write takes the BQL down with it; a guest spinning on its own does not.</p>
+
+<pre><code>echo info status | socat -T5 - UNIX-CONNECT:logs/freeze-mon.sock</code></pre>
+
+<h2>A related failure that is not this one</h2>
+
+<p>While chasing this, a Windows XP guest was also seen spinning on the status register — 38,433 reads, every one returning <code>0xd8</code>, never changing. That is an IEEE-1284 negotiation with nothing on the other end to answer it, and it is a different failure: the guest busy-waits, but QEMU stays healthy and the monitor answers normally. It also never reaches the blocking write, because STROBE is never raised during that sequence. Two symptoms that look alike from inside the guest, with different causes.</p>
+
+<h2>Not submitted upstream</h2>
+
+<p>QEMU <a href="https://www.qemu.org/docs/master/devel/code-provenance.html">declines contributions that include or derive from AI-generated content</a>, and the exception list is empty. This investigation and patch were produced with Claude, so the patch route is closed. The same policy explicitly does not cover using AI for debugging, so a bug report would have been possible; it was not filed.</p>
+
+<p><strong>This patch is therefore not in QEMU.</strong> If you want it, you have to apply it yourself, and the verification above is all there is.</p>
+
+<h2>Tested on</h2>
+
+<p>QEMU 11.1.50 (<code>v11.1.0-1474-g43922bf55e</code>) on Ubuntu 26.04 with KVM, against a <code>q35</code> Windows XP guest and a minimal Linux guest on the Alpine 6.12 x86 kernel. Full write-ups, traces and the captured stack are in the <a href="https://github.com/zirize/qemu-parallel-port-freeze">repository</a> (detailed documents are in Korean).</p>
+
+</main>
+<footer>
+  <p>Made by <a href="https://github.com/zirize">zirize</a> &middot; <a href="https://zirize.github.io/">More projects</a></p>
+</footer>
+</body>
+</html>
