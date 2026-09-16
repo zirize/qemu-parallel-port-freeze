@@ -1,0 +1,178 @@
+#!/bin/busybox sh
+# LPT 프로브 게스트. 커널 cmdline 의 probe= 값으로 테스트를 고른다.
+# 유휴 상태에서 LPT 를 전혀 만지지 않는 것이 이 게스트의 핵심 성질이다.
+
+/bin/busybox --install -s /bin
+mount -t proc     proc     /proc
+mount -t sysfs    sysfs    /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+
+DATA=888   # 0x378
+STAT=889   # 0x379
+CTRL=890   # 0x37a
+
+outb() { printf "$(printf '\\%03o' "$2")" | dd of=/dev/port bs=1 seek="$1" count=1 conv=notrunc 2>/dev/null; }
+inb()  { dd if=/dev/port bs=1 skip="$1" count=1 2>/dev/null | od -An -tu1 | tr -d ' \n'; }
+hex()  { printf '0x%02x' "$1"; }
+
+banner() { echo; echo "===== $* ====="; }
+
+# 1. 레지스터 모델 확인 — 데이터 래치가 되읽히는가
+t_detect() {
+    banner "detect: 데이터 래치 write/read-back"
+    for v in 170 85 255 0 36; do
+        outb $DATA $v
+        r=$(inb $DATA)
+        echo "  write $(hex $v) -> read $(hex $r)  $([ "$v" = "$r" ] && echo OK || echo MISMATCH)"
+    done
+    echo "  status $(hex $(inb $STAT))  control $(hex $(inb $CTRL))"
+}
+
+# 2. XP 가 돌던 IEEE-1284 협상 재현
+t_negotiate() {
+    N=${1:-2000}
+    banner "negotiate: IEEE-1284 확장 요청 (폴링 $N 회)"
+    outb $CTRL 12    # 0x0c  SELECT+INIT
+    outb $CTRL 12
+    outb $DATA 4     # 0x04  ECP 모드 확장 요청 바이트
+    outb $CTRL 6     # 0x06  제어 라인 전환
+    first=$(inb $STAT)
+    echo "  최초 상태 $(hex $first)"
+    t0=$(cut -d' ' -f1 /proc/uptime)
+    changed=0; last=$first; i=0
+    while [ $i -lt "$N" ]; do
+        s=$(inb $STAT)
+        if [ "$s" != "$last" ]; then
+            echo "  변화! $i 회차: $(hex $last) -> $(hex $s)"
+            changed=$((changed+1)); last=$s
+        fi
+        i=$((i+1))
+    done
+    t1=$(cut -d' ' -f1 /proc/uptime)
+    echo "  최종 상태 $(hex $last)  변화 $changed 회  경과 ${t0}s -> ${t1}s"
+    [ $changed -eq 0 ] && echo "  => 응답 없음. 상태 라인이 고정. 무한 대기 조건 성립."
+}
+
+# 3. SPP strobe 로 실제 바이트 출력 — chardev 경로가 살아있는지
+t_print() {
+    banner "print: SPP strobe 로 'LPT-PROBE\\n' 출력"
+    outb $CTRL 12
+    for c in 76 80 84 45 80 82 79 66 69 10; do
+        outb $DATA $c
+        outb $CTRL 13   # strobe high
+        outb $CTRL 12   # strobe low
+    done
+    echo "  10 바이트 전송. 호스트쪽 lpt-out.bin 확인할 것."
+    echo "  status $(hex $(inb $STAT))"
+}
+
+# 3b. 정확히 write 1 회만. 프롤로그 귀속용.
+t_one() {
+    banner "one: 데이터 레지스터에 0x24 를 단 한 번 write"
+    outb $DATA 36
+    echo "  완료."
+}
+
+# 5. 드라이버 계층 — 실제 parport_pc + lp 로 출력을 시도한다.
+#    각 단계마다 표식을 찍는다. 멈추면 마지막 표식이 범행 지점이다.
+t_driver() {
+    banner "driver: parport_pc + lp 로 실제 출력"
+    echo "  [1] insmod parport"
+    insmod /lib/modules/parport.ko            && echo "      ok" || echo "      FAIL"
+    echo "  [2] insmod parport_pc io=0x378 irq=none"
+    insmod /lib/modules/parport_pc.ko io=0x378 irq=none && echo "      ok" || echo "      FAIL"
+    echo "  [3] 등록된 포트"
+    ls /sys/class/ppdev 2>/dev/null; cat /proc/sys/dev/parport/parport0/base-addr 2>/dev/null
+    ls -d /sys/bus/parport/devices/* 2>/dev/null
+    echo "  [4] insmod lp"
+    insmod /lib/modules/lp.ko                 && echo "      ok" || echo "      FAIL"
+    ls -la /dev/lp* 2>&1
+    echo "  [5] /dev/lp0 열기"
+    exec 3>/dev/lp0 && echo "      열림" || echo "      열기 실패"
+    echo "  [6] 바이트 쓰기"
+    echo "LPT-DRIVER-TEST" >&3 && echo "      write 반환됨" || echo "      write 실패"
+    echo "  [7] 닫기"
+    exec 3>&-
+    echo "      완료"
+    dmesg | grep -i -E 'parport|lp[0-9]' | tail -20
+}
+
+# 6. 대량 출력 — 소켓 상대가 안 읽어갈 때 vCPU 가 멈추는지 본다.
+t_flood() {
+    banner "flood: /dev/lp0 로 대량 출력"
+    insmod /lib/modules/parport.ko
+    insmod /lib/modules/parport_pc.ko io=0x378 irq=none
+    insmod /lib/modules/lp.ko
+    echo "  모듈 적재 완료. 8KB 씩 표식을 찍으며 쓴다."
+    i=0
+    LIM=$(sed -n 's/.*floodn=\([0-9]*\).*/\1/p' /proc/cmdline); [ -z "$LIM" ] && LIM=64
+    while [ $i -lt "$LIM" ]; do
+        dd if=/dev/zero of=/dev/lp0 bs=8192 count=1 conv=notrunc 2>/dev/null
+        i=$((i+1))
+        echo "  ...$((i*8))KB @ $(cut -d" " -f1 /proc/uptime)s"
+    done
+    echo "  전량 전송 완료."
+}
+
+# 7. IRQ 모드 — ACK 인터럽트 보류/재개 경로를 실제로 밟는다.
+#    parport_pc 를 irq=7 로 올리면 lp 가 인터럽트 구동으로 돈다.
+t_irq() {
+    banner "irq: IRQ 7 모드로 출력 (ACK 보류 경로 검증)"
+    insmod /lib/modules/parport.ko
+    insmod /lib/modules/parport_pc.ko io=0x378 irq=7
+    insmod /lib/modules/lp.ko
+    echo "  parport IRQ 설정:"
+    cat /proc/sys/dev/parport/parport0/irq 2>/dev/null | sed 's/^/    irq=/'
+    before=$(grep -i parport /proc/interrupts | awk '{print $2}')
+    echo "    인터럽트 수(전): ${before:-없음}"
+    N=$(sed -n 's/.*irqn=\([0-9]*\).*/\1/p' /proc/cmdline); [ -z "$N" ] && N=32
+    echo "  ${N}x8KB 출력 시작"
+    i=0
+    while [ $i -lt "$N" ]; do
+        dd if=/dev/zero of=/dev/lp0 bs=8192 count=1 conv=notrunc 2>/dev/null
+        i=$((i+1))
+        echo "  ...$((i*8))KB @ $(cut -d" " -f1 /proc/uptime)s"
+    done
+    after=$(grep -i parport /proc/interrupts | awk '{print $2}')
+    echo "    인터럽트 수(후): ${after:-없음}"
+    grep -i parport /proc/interrupts | sed 's/^/    /'
+    echo "  완료."
+}
+
+# 4. 유휴 — 아무것도 안 하고 대기. 기준선 측정용.
+t_idle() {
+    banner "idle: 30 초 무동작 (기준선)"
+    sleep 30
+    echo "  완료."
+}
+
+PROBE=$(sed -n 's/.*probe=\([^ ]*\).*/\1/p' /proc/cmdline)
+[ -z "$PROBE" ] && PROBE=shell
+
+echo
+echo "### LPT PROBE GUEST / probe=$PROBE"
+echo "### kernel $(uname -r)"
+
+for p in $(echo "$PROBE" | tr ',' ' '); do
+    case "$p" in
+        detect)    t_detect ;;
+        negotiate) t_negotiate 2000 ;;
+        spin)      t_negotiate 20000 ;;
+        print)     t_print ;;
+        one)       t_one ;;
+        driver)    t_driver ;;
+        flood)     t_flood ;;
+        irq)       t_irq ;;
+        idle)      t_idle ;;
+        shell)     ;;
+        *) echo "알 수 없는 프로브: $p" ;;
+    esac
+done
+
+echo
+echo "### PROBE DONE"
+
+case "$PROBE" in
+    *shell*) exec setsid cttyhack sh ;;
+    *) sync; poweroff -f ;;
+esac

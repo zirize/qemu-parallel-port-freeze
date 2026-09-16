@@ -1,0 +1,9 @@
+# 재생성 가능한 대용량 바이너리
+guest/vmlinuz-lts
+guest/busybox-i686
+guest/modloop-lts
+guest/initramfs.cpio.gz
+guest/mods/
+# 런 산출물
+logs/
+__pycache__/

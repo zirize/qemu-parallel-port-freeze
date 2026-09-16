@@ -1,0 +1,28 @@
+# 패치 전 QEMU 가 정체한 시점의 스레드 스택 (eu-stack)
+# 런: stack-before / 바이너리: qemu-system-i386.bak-20260917-prelpt (v11.1.0-1474-g43922bf55e)
+# 시점: t=90s, 게스트 1328KB 에서 정지, 소켓 Send-Q 1,357,824
+
+TID 519561:   ← vCPU 스레드. 여기가 범행 현장이다.
+#2  clock_nanosleep@GLIBC_2.2.5
+#3  __nanosleep
+#4  g_usleep                       ← chardev/char.c 의 EAGAIN 재시도
+#5  qemu_chr_write_buffer
+#6  qemu_chr_write
+#7  parallel_ioport_write_sw       ← hw/char/parallel.c 의 STROBE 처리
+#8  memory_region_write_accessor
+#9  access_with_adjusted_size
+#10 memory_region_dispatch_write
+#11 flatview_write_continue_step.isra.0
+#12 flatview_write
+#13 address_space_rw
+
+TID 519559:   ← 메인 스레드. BQL 을 못 잡고 서 있다.
+#0  __GI___lll_lock_wait
+#1  __pthread_mutex_lock@GLIBC_2.2.5
+#2  qemu_mutex_lock_impl
+#3  main_loop_wait                 ← 그래서 HMP 모니터가 응답하지 않는다
+#4  qemu_main_loop
+#5  qemu_default_main
+#6  main
+
+TID 519560:  call_rcu_thread (qemu_event_wait) — 정상

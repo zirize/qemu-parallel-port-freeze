@@ -1,0 +1,25 @@
+# 발췌 — 원시 로그는 저장소에 넣지 않는다 (6MB). 재현은 scripts/lpt-trace.sh 참조.
+
+## 부팅 구간: 포트 감지 (0xAA/0x55 쓰고 되읽기)
+3:parallel_ioport_write write [SW] addr 0x00 val 0xaa
+4:parallel_ioport_read read [SW] addr 0x00 val 0xaa
+13:parallel_ioport_write write [SW] addr 0x00 val 0xaa
+14:parallel_ioport_write write [SW] addr 0x00 val 0x55
+22:parallel_ioport_write write [SW] addr 0x00 val 0xaa
+23:parallel_ioport_write write [SW] addr 0x00 val 0x55
+
+## IEEE-1284 협상 + 응답 없는 상태 폴링
+parallel_ioport_read read [SW] addr 0x01 val 0xd8
+parallel_ioport_read read [SW] addr 0x02 val 0xcc
+parallel_ioport_write write [SW] addr 0x02 val 0x0c
+parallel_ioport_write write [SW] addr 0x02 val 0x0c
+parallel_ioport_write write [SW] addr 0x00 val 0x04
+parallel_ioport_write write [SW] addr 0x02 val 0x06
+parallel_ioport_read read [SW] addr 0x01 val 0xd8
+parallel_ioport_read read [SW] addr 0x01 val 0xd8
+parallel_ioport_read read [SW] addr 0x01 val 0xd8
+parallel_ioport_read read [SW] addr 0x01 val 0xd8
+parallel_ioport_read read [SW] addr 0x01 val 0xd8
+parallel_ioport_read read [SW] addr 0x01 val 0xd8
+parallel_ioport_read read [SW] addr 0x01 val 0xd8
+  ... (동일한 0xd8 읽기가 38,433회 반복)

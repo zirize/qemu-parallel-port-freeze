@@ -1,0 +1,4 @@
+### <패치-전-qemu>
+###   QEMU emulator version 11.1.50 (v11.1.0-1474-g43922bf55e)
+###   sha256:926bb16cd819ce7f  mtime:2026-09-16 23:39:49
+### -M q35 / probe=irq / chardev=socket,id=lptfile,host=127.0.0.1,port=9100,server=off
