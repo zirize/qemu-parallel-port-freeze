@@ -1,5 +1,7 @@
 # qemu-parallel-port-freeze
 
+📄 Project page: **[QEMU freezes when printing to a parallel port: the blocking chardev write](https://zirize.github.io/qemu-parallel-port-freeze/)** · More projects: **[zirize.github.io](https://zirize.github.io/)**
+
 **A parallel-port write can freeze the entire QEMU VM.** Not just the guest —
 the monitor stops answering and the process ignores `SIGTERM`.
 
