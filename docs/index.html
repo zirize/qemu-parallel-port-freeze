@@ -129,10 +129,12 @@ footer{text-align:center;padding:32px 20px;border-top:1px solid var(--border);co
 
 <table>
 <tr><th>Configuration</th><th>Stalls after</th></tr>
-<tr><td>Linux harness, sink with a 4 KB receive buffer</td><td>1,357,824 bytes</td></tr>
+<tr><td>Linux harness</td><td>1,357,824 bytes</td></tr>
 <tr><td>Windows XP guest</td><td>1,792,000 bytes</td></tr>
 <tr><td>For scale — one Windows XP printer test page</td><td>146,613 bytes</td></tr>
 </table>
+
+<p>The threshold is set by the <em>sender</em>, not the receiver. A smaller receive buffer only makes it fill faster: two Linux runs against sinks with different receive buffers both stalled at the same 1,357,824 bytes, because the limit is QEMU's own socket send queue — and <code>sk_wmem_queued</code> counts skb overhead, so the payload hits the ceiling earlier than <code>tcp_wmem</code> would suggest.</p>
 
 <p>On XP, <code>copy /b c:\windows\explorer.exe lpt1:</code> (1,025,049 bytes) <strong>completes normally</strong> against a sink that reads nothing at all. A printer test page is a twelfth of the threshold. So a stalled backend plus a small job looks perfectly healthy — do not conclude from that test that you are safe.</p>
 
